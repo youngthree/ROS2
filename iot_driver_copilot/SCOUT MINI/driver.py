@@ -1,152 +1,165 @@
 import os
 import threading
 import time
-import struct
-from flask import Flask, jsonify, request
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+
+# ROS dependencies
 import rospy
-from std_msgs.msg import Empty
-from nav_msgs.msg import Odometry
+from std_msgs.msg import String
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 
-# Load configuration from environment variables
-HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
-HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
-ROS_MASTER_URI = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
-ROBOT_NAMESPACE = os.environ.get("ROBOT_NAMESPACE", "")  # Optional
+# Environment Variables
+SERVER_HOST = os.environ.get('SCOUTMINI_DRIVER_HTTP_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SCOUTMINI_DRIVER_HTTP_PORT', '8080'))
+ROS_MASTER_URI = os.environ.get('SCOUTMINI_DRIVER_ROS_MASTER_URI', 'http://localhost:11311')
+ROS_NAMESPACE = os.environ.get('SCOUTMINI_DRIVER_ROS_NAMESPACE', '')  # Optional
 
-# ROS topic names, can also be set via env vars
-TOPIC_CMD_VEL = os.environ.get("TOPIC_CMD_VEL", "/cmd_vel")
-TOPIC_ODOM = os.environ.get("TOPIC_ODOM", "/odom")
+# ROS Node Initialization
+def ros_spin():
+    # Set ROS master URI if needed
+    if ROS_MASTER_URI:
+        os.environ['ROS_MASTER_URI'] = ROS_MASTER_URI
+    rospy.init_node('scoutmini_http_driver', anonymous=True, disable_signals=True)
+    rospy.spin()
 
-# Movement parameters
-DEFAULT_LINEAR_SPEED = float(os.environ.get("DEFAULT_LINEAR_SPEED", "0.2"))
-DEFAULT_ANGULAR_SPEED = float(os.environ.get("DEFAULT_ANGULAR_SPEED", "0.5"))
+# Command Publisher (Twist)
+class ScoutMiniROSBridge:
+    def __init__(self):
+        cmd_vel_topic = os.path.join(ROS_NAMESPACE, "cmd_vel") if ROS_NAMESPACE else "cmd_vel"
+        odom_topic = os.path.join(ROS_NAMESPACE, "odom") if ROS_NAMESPACE else "odom"
+        self.cmd_vel_pub = rospy.Publisher(cmd_vel_topic, Twist, queue_size=1)
+        self.odom_topic = odom_topic
+        self.latest_odom = None
+        self.odom_lock = threading.Lock()
+        self.odom_sub = rospy.Subscriber(self.odom_topic, Odometry, self.odom_callback)
 
-# ROS initialization flag and odometry cache
-ros_initialized = False
-odom_cache = {}
-odom_lock = threading.Lock()
+    def odom_callback(self, msg):
+        with self.odom_lock:
+            self.latest_odom = msg
 
-# Flask app
-app = Flask(__name__)
+    def move(self, linear_x=0.0, angular_z=0.0):
+        twist = Twist()
+        twist.linear.x = linear_x
+        twist.angular.z = angular_z
+        self.cmd_vel_pub.publish(twist)
 
-# Ensure ROS is initialized only once and in a background thread for Flask compatibility
-def ros_init():
-    global ros_initialized
-    if not ros_initialized:
-        rospy.init_node('scout_mini_http_driver', anonymous=True, disable_signals=True)
-        ros_initialized = True
+    def stop(self):
+        self.move(0.0, 0.0)
 
-def ros_spin_thread():
-    while not rospy.is_shutdown():
-        rospy.sleep(0.1)
+    def get_latest_odom(self):
+        with self.odom_lock:
+            return self.latest_odom
 
-def start_ros():
-    ros_init()
-    # Subscribe to odometry
-    rospy.Subscriber(TOPIC_ODOM, Odometry, odom_callback)
-    # Start a background spinning thread
-    t = threading.Thread(target=ros_spin_thread, daemon=True)
-    t.start()
+bridge = None
 
-def odom_callback(msg):
-    with odom_lock:
-        odom_cache['seq'] = msg.header.seq
-        odom_cache['stamp'] = msg.header.stamp.to_sec()
-        odom_cache['frame_id'] = msg.header.frame_id
-        odom_cache['child_frame_id'] = msg.child_frame_id
-
-        odom_cache['pose'] = {
-            'position': {
-                'x': msg.pose.pose.position.x,
-                'y': msg.pose.pose.position.y,
-                'z': msg.pose.pose.position.z
+# Utility to convert ROS Odometry to dict
+def odom_to_dict(odom_msg):
+    if not odom_msg:
+        return None
+    return {
+        "header": {
+            "seq": odom_msg.header.seq,
+            "stamp": odom_msg.header.stamp.to_sec(),
+            "frame_id": odom_msg.header.frame_id,
+        },
+        "child_frame_id": odom_msg.child_frame_id,
+        "pose": {
+            "position": {
+                "x": odom_msg.pose.pose.position.x,
+                "y": odom_msg.pose.pose.position.y,
+                "z": odom_msg.pose.pose.position.z,
             },
-            'orientation': {
-                'x': msg.pose.pose.orientation.x,
-                'y': msg.pose.pose.orientation.y,
-                'z': msg.pose.pose.orientation.z,
-                'w': msg.pose.pose.orientation.w
-            }
-        }
-        odom_cache['twist'] = {
-            'linear': {
-                'x': msg.twist.twist.linear.x,
-                'y': msg.twist.twist.linear.y,
-                'z': msg.twist.twist.linear.z
+            "orientation": {
+                "x": odom_msg.pose.pose.orientation.x,
+                "y": odom_msg.pose.pose.orientation.y,
+                "z": odom_msg.pose.pose.orientation.z,
+                "w": odom_msg.pose.pose.orientation.w,
             },
-            'angular': {
-                'x': msg.twist.twist.angular.x,
-                'y': msg.twist.twist.angular.y,
-                'z': msg.twist.twist.angular.z
-            }
-        }
+            "covariance": list(odom_msg.pose.covariance),
+        },
+        "twist": {
+            "linear": {
+                "x": odom_msg.twist.twist.linear.x,
+                "y": odom_msg.twist.twist.linear.y,
+                "z": odom_msg.twist.twist.linear.z,
+            },
+            "angular": {
+                "x": odom_msg.twist.twist.angular.x,
+                "y": odom_msg.twist.twist.angular.y,
+                "z": odom_msg.twist.twist.angular.z,
+            },
+            "covariance": list(odom_msg.twist.covariance),
+        },
+    }
 
-def get_cmd_vel_publisher():
-    return rospy.Publisher(TOPIC_CMD_VEL, Twist, queue_size=1)
+class ScoutMiniHTTPRequestHandler(BaseHTTPRequestHandler):
+    def _set_headers(self, status=200):
+        self.send_response(status)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
 
-# Utility to send velocity command
-def send_velocity(linear_x=0.0, linear_y=0.0, angular_z=0.0, duration=None):
-    pub = get_cmd_vel_publisher()
-    twist = Twist()
-    twist.linear.x = linear_x
-    twist.linear.y = linear_y
-    twist.linear.z = 0.0
-    twist.angular.x = 0.0
-    twist.angular.y = 0.0
-    twist.angular.z = angular_z
-    pub.publish(twist)
-    if duration:
-        time.sleep(duration)
-        # Send stop
-        twist.linear.x = 0.0
-        twist.linear.y = 0.0
-        twist.angular.z = 0.0
-        pub.publish(twist)
+    def _respond(self, data, status=200):
+        self._set_headers(status)
+        self.wfile.write(json.dumps(data).encode('utf-8'))
 
-@app.route("/move/forward", methods=["GET"])
-def move_forward():
-    speed = float(request.args.get("speed", DEFAULT_LINEAR_SPEED))
-    duration = float(request.args.get("duration", "0"))
-    send_velocity(linear_x=speed, duration=duration if duration > 0 else None)
-    return jsonify({"result": "Moving forward", "speed": speed, "duration": duration})
+    def do_GET(self):
+        global bridge
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        params = parse_qs(parsed_path.query)
+        # Optional speed parameter for move/forward and move/backward
+        speed = float(params.get('speed', [0.2])[0])  # Default speed: 0.2 m/s
+        angular_speed = float(params.get('angular_speed', [0.5])[0])  # Default angular speed: 0.5 rad/s
 
-@app.route("/move/backward", methods=["GET"])
-def move_backward():
-    speed = float(request.args.get("speed", DEFAULT_LINEAR_SPEED))
-    duration = float(request.args.get("duration", "0"))
-    send_velocity(linear_x=-speed, duration=duration if duration > 0 else None)
-    return jsonify({"result": "Moving backward", "speed": speed, "duration": duration})
+        if path == '/move/forward':
+            bridge.move(linear_x=abs(speed), angular_z=0.0)
+            self._respond({"result": "Moving forward", "speed": abs(speed)})
 
-@app.route("/turn/left", methods=["GET"])
-def turn_left():
-    angular = float(request.args.get("angular_speed", DEFAULT_ANGULAR_SPEED))
-    duration = float(request.args.get("duration", "0"))
-    send_velocity(angular_z=angular, duration=duration if duration > 0 else None)
-    return jsonify({"result": "Turning left", "angular_speed": angular, "duration": duration})
+        elif path == '/move/backward':
+            bridge.move(linear_x=-abs(speed), angular_z=0.0)
+            self._respond({"result": "Moving backward", "speed": -abs(speed)})
 
-@app.route("/turn/right", methods=["GET"])
-def turn_right():
-    angular = float(request.args.get("angular_speed", DEFAULT_ANGULAR_SPEED))
-    duration = float(request.args.get("duration", "0"))
-    send_velocity(angular_z=-angular, duration=duration if duration > 0 else None)
-    return jsonify({"result": "Turning right", "angular_speed": angular, "duration": duration})
+        elif path == '/turn/left':
+            bridge.move(linear_x=0.0, angular_z=abs(angular_speed))
+            self._respond({"result": "Turning left", "angular_speed": abs(angular_speed)})
 
-@app.route("/stop", methods=["GET"])
-def stop():
-    send_velocity(0.0, 0.0, 0.0)
-    return jsonify({"result": "Stopped"})
+        elif path == '/turn/right':
+            bridge.move(linear_x=0.0, angular_z=-abs(angular_speed))
+            self._respond({"result": "Turning right", "angular_speed": -abs(angular_speed)})
 
-@app.route("/odom", methods=["GET"])
-def odom():
-    with odom_lock:
-        if odom_cache:
-            return jsonify({"odometry": odom_cache})
-    return jsonify({"error": "No odometry data available"}), 503
+        elif path == '/stop':
+            bridge.stop()
+            self._respond({"result": "Stopped"})
 
-def main():
-    start_ros()
-    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
+        elif path == '/odom':
+            odom_msg = bridge.get_latest_odom()
+            if odom_msg:
+                odom_dict = odom_to_dict(odom_msg)
+                self._respond(odom_dict)
+            else:
+                self._respond({"error": "Odometry data not available"}, status=503)
 
-if __name__ == "__main__":
-    main()
+        else:
+            self._respond({"error": "Endpoint not found"}, status=404)
+
+def start_ros_node():
+    # To ensure ROS node runs in the background
+    thread = threading.Thread(target=ros_spin, daemon=True)
+    thread.start()
+    # Wait until rospy is ready
+    while not rospy.core.is_initialized():
+        time.sleep(0.1)
+    global bridge
+    bridge = ScoutMiniROSBridge()
+
+def run_server():
+    httpd = HTTPServer((SERVER_HOST, SERVER_PORT), ScoutMiniHTTPRequestHandler)
+    print(f"SCOUT MINI HTTP driver running at http://{SERVER_HOST}:{SERVER_PORT}")
+    httpd.serve_forever()
+
+if __name__ == '__main__':
+    start_ros_node()
+    run_server()
