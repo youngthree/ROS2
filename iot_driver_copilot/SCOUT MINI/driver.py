@@ -1,182 +1,175 @@
 import os
 import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
-
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import socketserver
 import rospy
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Twist
 
-# Configuration via environment variables
-ROS_MASTER_URI = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
-ROS_IP = os.environ.get("ROS_IP", "127.0.0.1")
-DEVICE_NAMESPACE = os.environ.get("DEVICE_NAMESPACE", "")
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
-ODOM_TOPIC = os.environ.get("ODOM_TOPIC", "/odom")
-IMU_TOPIC = os.environ.get("IMU_TOPIC", "/imu")
-CMD_VEL_TOPIC = os.environ.get("CMD_VEL_TOPIC", "/cmd_vel")
+# Environment Variables Configuration
+ROBOT_MASTER_URI = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
+ROS_HOSTNAME = os.environ.get("ROS_HOSTNAME", "localhost")
+SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
 
-os.environ["ROS_MASTER_URI"] = ROS_MASTER_URI
-os.environ["ROS_IP"] = ROS_IP
-
-# ROS Node initialization in a thread-safe way
-rospy_inited = threading.Event()
-
+# Initialize ROS node (in thread)
 def ros_spin():
-    rospy.init_node('scoutmini_http_driver', anonymous=True, disable_signals=True)
-    rospy_inited.set()
     rospy.spin()
 
-threading.Thread(target=ros_spin, daemon=True).start()
-rospy_inited.wait(timeout=10)
+rospy.init_node('scout_mini_http_driver', anonymous=True, disable_signals=True)
 
 latest_odom = {}
 latest_imu = {}
+odom_lock = threading.Lock()
+imu_lock = threading.Lock()
 
 def odom_callback(msg):
     global latest_odom
-    latest_odom = {
-        "header": {
-            "seq": msg.header.seq,
-            "stamp": {
-                "secs": msg.header.stamp.secs,
-                "nsecs": msg.header.stamp.nsecs
+    with odom_lock:
+        latest_odom = {
+            "header": {
+                "seq": msg.header.seq,
+                "stamp": msg.header.stamp.to_sec(),
+                "frame_id": msg.header.frame_id
             },
-            "frame_id": msg.header.frame_id
-        },
-        "child_frame_id": msg.child_frame_id,
-        "pose": {
+            "child_frame_id": msg.child_frame_id,
             "pose": {
-                "position": {
-                    "x": msg.pose.pose.position.x,
-                    "y": msg.pose.pose.position.y,
-                    "z": msg.pose.pose.position.z
+                "pose": {
+                    "position": {
+                        "x": msg.pose.pose.position.x,
+                        "y": msg.pose.pose.position.y,
+                        "z": msg.pose.pose.position.z
+                    },
+                    "orientation": {
+                        "x": msg.pose.pose.orientation.x,
+                        "y": msg.pose.pose.orientation.y,
+                        "z": msg.pose.pose.orientation.z,
+                        "w": msg.pose.pose.orientation.w
+                    }
                 },
-                "orientation": {
-                    "x": msg.pose.pose.orientation.x,
-                    "y": msg.pose.pose.orientation.y,
-                    "z": msg.pose.pose.orientation.z,
-                    "w": msg.pose.pose.orientation.w
-                }
+                "covariance": list(msg.pose.covariance)
             },
-            "covariance": list(msg.pose.covariance)
-        },
-        "twist": {
             "twist": {
-                "linear": {
-                    "x": msg.twist.twist.linear.x,
-                    "y": msg.twist.twist.linear.y,
-                    "z": msg.twist.twist.linear.z
+                "twist": {
+                    "linear": {
+                        "x": msg.twist.twist.linear.x,
+                        "y": msg.twist.twist.linear.y,
+                        "z": msg.twist.twist.linear.z
+                    },
+                    "angular": {
+                        "x": msg.twist.twist.angular.x,
+                        "y": msg.twist.twist.angular.y,
+                        "z": msg.twist.twist.angular.z
+                    }
                 },
-                "angular": {
-                    "x": msg.twist.twist.angular.x,
-                    "y": msg.twist.twist.angular.y,
-                    "z": msg.twist.twist.angular.z
-                }
-            },
-            "covariance": list(msg.twist.covariance)
+                "covariance": list(msg.twist.covariance)
+            }
         }
-    }
 
 def imu_callback(msg):
     global latest_imu
-    latest_imu = {
-        "header": {
-            "seq": msg.header.seq,
-            "stamp": {
-                "secs": msg.header.stamp.secs,
-                "nsecs": msg.header.stamp.nsecs
+    with imu_lock:
+        latest_imu = {
+            "header": {
+                "seq": msg.header.seq,
+                "stamp": msg.header.stamp.to_sec(),
+                "frame_id": msg.header.frame_id
             },
-            "frame_id": msg.header.frame_id
-        },
-        "orientation": {
-            "x": msg.orientation.x,
-            "y": msg.orientation.y,
-            "z": msg.orientation.z,
-            "w": msg.orientation.w
-        },
-        "orientation_covariance": list(msg.orientation_covariance),
-        "angular_velocity": {
-            "x": msg.angular_velocity.x,
-            "y": msg.angular_velocity.y,
-            "z": msg.angular_velocity.z
-        },
-        "angular_velocity_covariance": list(msg.angular_velocity_covariance),
-        "linear_acceleration": {
-            "x": msg.linear_acceleration.x,
-            "y": msg.linear_acceleration.y,
-            "z": msg.linear_acceleration.z
-        },
-        "linear_acceleration_covariance": list(msg.linear_acceleration_covariance)
-    }
+            "orientation": {
+                "x": msg.orientation.x,
+                "y": msg.orientation.y,
+                "z": msg.orientation.z,
+                "w": msg.orientation.w
+            },
+            "orientation_covariance": list(msg.orientation_covariance),
+            "angular_velocity": {
+                "x": msg.angular_velocity.x,
+                "y": msg.angular_velocity.y,
+                "z": msg.angular_velocity.z
+            },
+            "angular_velocity_covariance": list(msg.angular_velocity_covariance),
+            "linear_acceleration": {
+                "x": msg.linear_acceleration.x,
+                "y": msg.linear_acceleration.y,
+                "z": msg.linear_acceleration.z
+            },
+            "linear_acceleration_covariance": list(msg.linear_acceleration_covariance)
+        }
 
-# Subscribe to topics
-rospy.Subscriber(ODOM_TOPIC, Odometry, odom_callback, queue_size=1)
-rospy.Subscriber(IMU_TOPIC, Imu, imu_callback, queue_size=1)
+rospy.Subscriber("/odom", Odometry, odom_callback)
+rospy.Subscriber("/imu", Imu, imu_callback)
+cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
 
-cmd_vel_publisher = rospy.Publisher(CMD_VEL_TOPIC, Twist, queue_size=1)
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 class ScoutMiniHTTPRequestHandler(BaseHTTPRequestHandler):
-    def _set_headers(self, status=200, content_type="application/json"):
+    def _set_json_headers(self, status=200):
         self.send_response(status)
-        self.send_header('Content-type', content_type)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-type', 'application/json')
         self.end_headers()
 
     def do_GET(self):
         if self.path == '/odom':
-            self._set_headers()
-            self.wfile.write(json.dumps(latest_odom).encode('utf-8'))
+            with odom_lock:
+                data = latest_odom.copy()
+            if not data:
+                self._set_json_headers(503)
+                self.wfile.write(json.dumps({"error": "Odometry data not available"}).encode())
+            else:
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps(data).encode())
         elif self.path == '/imu':
-            self._set_headers()
-            self.wfile.write(json.dumps(latest_imu).encode('utf-8'))
+            with imu_lock:
+                data = latest_imu.copy()
+            if not data:
+                self._set_json_headers(503)
+                self.wfile.write(json.dumps({"error": "IMU data not available"}).encode())
+            else:
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps(data).encode())
         else:
-            self._set_headers(404)
-            self.wfile.write(json.dumps({"error": "Not Found"}).encode('utf-8'))
+            self.send_error(404, "Not Found")
 
     def do_POST(self):
         if self.path == '/cmd_vel':
             content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length)
+            if content_length == 0:
+                self._set_json_headers(400)
+                self.wfile.write(json.dumps({"error": "Empty request body"}).encode())
+                return
             try:
-                data = json.loads(body)
+                post_data = self.rfile.read(content_length)
+                data = json.loads(post_data.decode())
                 twist = Twist()
-                # Fill linear
-                if "linear" in data:
-                    linear = data["linear"]
-                    twist.linear.x = float(linear.get("x", 0.0))
-                    twist.linear.y = float(linear.get("y", 0.0))
-                    twist.linear.z = float(linear.get("z", 0.0))
-                # Fill angular
-                if "angular" in data:
-                    angular = data["angular"]
-                    twist.angular.x = float(angular.get("x", 0.0))
-                    twist.angular.y = float(angular.get("y", 0.0))
-                    twist.angular.z = float(angular.get("z", 0.0))
-                cmd_vel_publisher.publish(twist)
-                self._set_headers(200)
-                self.wfile.write(json.dumps({"status": "ok"}).encode('utf-8'))
+                twist.linear.x = float(data.get("linear", {}).get("x", 0.0))
+                twist.linear.y = float(data.get("linear", {}).get("y", 0.0))
+                twist.linear.z = float(data.get("linear", {}).get("z", 0.0))
+                twist.angular.x = float(data.get("angular", {}).get("x", 0.0))
+                twist.angular.y = float(data.get("angular", {}).get("y", 0.0))
+                twist.angular.z = float(data.get("angular", {}).get("z", 0.0))
+                cmd_vel_pub.publish(twist)
+                self._set_json_headers(200)
+                self.wfile.write(json.dumps({"status": "ok"}).encode())
             except Exception as e:
-                self._set_headers(400)
-                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+                self._set_json_headers(400)
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
         else:
-            self._set_headers(404)
-            self.wfile.write(json.dumps({"error": "Not Found"}).encode('utf-8'))
+            self.send_error(404, "Not Found")
 
-def run_server():
-    server_address = (HTTP_SERVER_HOST, HTTP_SERVER_PORT)
-    httpd = HTTPServer(server_address, ScoutMiniHTTPRequestHandler)
-    print(f"Starting HTTP server at http://{HTTP_SERVER_HOST}:{HTTP_SERVER_PORT}")
-    httpd.serve_forever()
+def main():
+    ros_thread = threading.Thread(target=ros_spin, daemon=True)
+    ros_thread.start()
+    httpd = ThreadedHTTPServer((SERVER_HOST, SERVER_PORT), ScoutMiniHTTPRequestHandler)
+    print(f"Scout Mini HTTP driver running at http://{SERVER_HOST}:{SERVER_PORT} ...")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
 
 if __name__ == "__main__":
-    run_server()
+    main()
