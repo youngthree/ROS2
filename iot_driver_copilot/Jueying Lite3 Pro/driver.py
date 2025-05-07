@@ -1,173 +1,203 @@
 import os
-import json
-import socket
-import struct
 import threading
+import time
+import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
-# Environment configuration
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-DEVICE_UDP_PORT = int(os.environ.get("DEVICE_UDP_PORT", "8001"))
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Imu
+from geometry_msgs.msg import Twist
+from std_msgs.msg import String
 
-# UDP Client for sending commands (threadsafe)
-class UDPClient:
-    def __init__(self, ip, port):
-        self.addr = (ip, port)
+# Configuration from environment variables
+ROBOT_IP = os.environ.get('ROBOT_IP', '127.0.0.1')
+ROS_DOMAIN_ID = int(os.environ.get('ROS_DOMAIN_ID', '0'))
+HTTP_HOST = os.environ.get('HTTP_HOST', '0.0.0.0')
+HTTP_PORT = int(os.environ.get('HTTP_PORT', '8080'))
+
+os.environ['ROS_DOMAIN_ID'] = str(ROS_DOMAIN_ID)
+
+rclpy.init(args=None)
+
+class ImuDataBuffer:
+    def __init__(self):
         self.lock = threading.Lock()
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(2.0)  # 2 seconds timeout
+        self.latest_imu = None
 
-    def send(self, data: bytes):
+    def update(self, msg):
         with self.lock:
-            self.sock.sendto(data, self.addr)
+            self.latest_imu = msg
 
-    def send_and_receive(self, data: bytes, bufsize=4096):
+    def get(self):
         with self.lock:
-            self.sock.sendto(data, self.addr)
-            try:
-                resp, _ = self.sock.recvfrom(bufsize)
-                return resp
-            except socket.timeout:
-                return b''
+            return self.latest_imu
 
-# UDP Sensor Data Receiver
-class UDPSensorReceiver(threading.Thread):
-    def __init__(self, ip, port):
-        super().__init__(daemon=True)
-        self.ip = ip
-        self.port = port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.ip, self.port))
-        self.running = True
-        self.latest_data = None
-        self.lock = threading.Lock()
+imu_buffer = ImuDataBuffer()
 
-    def run(self):
-        while self.running:
-            try:
-                data, _ = self.sock.recvfrom(65535)
-                with self.lock:
-                    self.latest_data = data
-            except Exception:
-                continue
+class RobotROSNode(Node):
+    def __init__(self):
+        super().__init__('driver_http_server_node')
+        self.imu_sub = self.create_subscription(
+            Imu,
+            '/imu/data',
+            self.imu_callback,
+            10
+        )
+        self.cmd_vel_pub = self.create_publisher(
+            Twist,
+            '/cmd_vel',
+            10
+        )
+        self.map_trigger_pub = self.create_publisher(
+            String,
+            '/slam/trigger',
+            10
+        )
+        self.localization_pub = self.create_publisher(
+            String,
+            '/localization/trigger',
+            10
+        )
 
-    def get_latest(self):
-        with self.lock:
-            if self.latest_data:
-                return self.latest_data
-            return None
+    def imu_callback(self, msg):
+        imu_buffer.update(msg)
 
-    def stop(self):
-        self.running = False
-        self.sock.close()
+    def publish_velocity(self, linear_x=0.0, linear_y=0.0, angular_z=0.0):
+        twist = Twist()
+        twist.linear.x = linear_x
+        twist.linear.y = linear_y
+        twist.angular.z = angular_z
+        self.cmd_vel_pub.publish(twist)
 
-# Helper functions for protocol serialization/deserialization
-def build_cmd_vel_payload(linear_x, linear_y, linear_z, angular_x, angular_y, angular_z):
-    # Example, pack as struct: 6 floats, network byte order (big endian)
-    return struct.pack('!6f', linear_x, linear_y, linear_z, angular_x, angular_y, angular_z)
+    def trigger_map(self):
+        msg = String()
+        msg.data = 'start'
+        self.map_trigger_pub.publish(msg)
 
-def parse_sensor_data(raw_data):
-    # For demonstration, try to decode as JSON or fallback to hex
-    try:
-        return json.loads(raw_data.decode())
-    except Exception:
-        return {"raw": raw_data.hex()}
+    def trigger_localization(self):
+        msg = String()
+        msg.data = 'start'
+        self.localization_pub.publish(msg)
 
-# UDP ports for sensor data and commands
-# We assume:
-#   - DEVICE_UDP_PORT: for commands (POSTs)
-#   - DEVICE_UDP_SENSOR_PORT: for sensor data (GET /sdata)
-DEVICE_UDP_SENSOR_PORT = int(os.environ.get("DEVICE_UDP_SENSOR_PORT", str(DEVICE_UDP_PORT + 1)))
+ros_node = RobotROSNode()
 
-udp_client = UDPClient(DEVICE_IP, DEVICE_UDP_PORT)
-sensor_receiver = UDPSensorReceiver("0.0.0.0", DEVICE_UDP_SENSOR_PORT)
-sensor_receiver.start()
+def spin_ros():
+    rclpy.spin(ros_node)
 
-# HTTP server
-class JueyingLite3ProHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/vctrl":
-            # Velocity command
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length)
-            try:
-                req = json.loads(body)
-                linear = req.get("linear", {})
-                angular = req.get("angular", {})
-                payload = build_cmd_vel_payload(
-                    float(linear.get("x", 0.0)),
-                    float(linear.get("y", 0.0)),
-                    float(linear.get("z", 0.0)),
-                    float(angular.get("x", 0.0)),
-                    float(angular.get("y", 0.0)),
-                    float(angular.get("z", 0.0)),
-                )
-                udp_client.send(payload)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok"}).encode())
-            except Exception as e:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+ros_thread = threading.Thread(target=spin_ros, daemon=True)
+ros_thread.start()
 
-        elif parsed.path == "/navopt":
-            # Navigation options
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length)
-            try:
-                # Here, payload format must be defined per device doc. We'll just forward as JSON bytes.
-                udp_client.send(body)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok"}).encode())
-            except Exception as e:
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
+def imu_msg_to_dict(msg):
+    return {
+        "header": {
+            "stamp": {
+                "sec": msg.header.stamp.sec,
+                "nanosec": msg.header.stamp.nanosec
+            },
+            "frame_id": msg.header.frame_id
+        },
+        "orientation": {
+            "x": msg.orientation.x,
+            "y": msg.orientation.y,
+            "z": msg.orientation.z,
+            "w": msg.orientation.w
+        },
+        "orientation_covariance": list(msg.orientation_covariance),
+        "angular_velocity": {
+            "x": msg.angular_velocity.x,
+            "y": msg.angular_velocity.y,
+            "z": msg.angular_velocity.z,
+        },
+        "angular_velocity_covariance": list(msg.angular_velocity_covariance),
+        "linear_acceleration": {
+            "x": msg.linear_acceleration.x,
+            "y": msg.linear_acceleration.y,
+            "z": msg.linear_acceleration.z,
+        },
+        "linear_acceleration_covariance": list(msg.linear_acceleration_covariance)
+    }
+
+class DriverRequestHandler(BaseHTTPRequestHandler):
+    server_version = "JueyingLite3ProHTTPDriver/1.0"
+
+    def _set_headers(self, status=200, content_type="application/json"):
+        self.send_response(status)
+        self.send_header('Content-type', content_type)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200, "ok")
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/sdata":
-            # Return latest sensor data as JSON
-            data = sensor_receiver.get_latest()
-            if data:
-                parsed_data = parse_sensor_data(data)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(parsed_data).encode())
-            else:
-                self.send_response(204)
-                self.end_headers()
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == '/imu':
+            self.handle_imu()
+        elif parsed_path.path == '/move':
+            self.handle_move(parsed_path)
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._set_headers(404)
+            self.wfile.write(json.dumps({"error": "Not found"}).encode())
 
-    def log_message(self, format, *args):
-        return  # Silence default console logging
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == '/map':
+            self.handle_map()
+        elif parsed_path.path == '/local':
+            self.handle_local()
+        else:
+            self._set_headers(404)
+            self.wfile.write(json.dumps({"error": "Not found"}).encode())
+
+    def handle_imu(self):
+        imu = imu_buffer.get()
+        if imu is None:
+            self._set_headers(503)
+            self.wfile.write(json.dumps({"error": "IMU data not available"}).encode())
+            return
+        self._set_headers()
+        self.wfile.write(json.dumps(imu_msg_to_dict(imu)).encode())
+
+    def handle_move(self, parsed_path):
+        params = parse_qs(parsed_path.query)
+        try:
+            linear_x = float(params.get('linear_x', [0.0])[0])
+            linear_y = float(params.get('linear_y', [0.0])[0])
+            angular_z = float(params.get('angular_z', [0.0])[0])
+        except Exception:
+            self._set_headers(400)
+            self.wfile.write(json.dumps({"error": "Invalid parameters"}).encode())
+            return
+        ros_node.publish_velocity(linear_x=linear_x, linear_y=linear_y, angular_z=angular_z)
+        self._set_headers()
+        self.wfile.write(json.dumps({"status": "ok", "linear_x": linear_x, "linear_y": linear_y, "angular_z": angular_z}).encode())
+
+    def handle_map(self):
+        ros_node.trigger_map()
+        self._set_headers()
+        self.wfile.write(json.dumps({"status": "mapping_triggered"}).encode())
+
+    def handle_local(self):
+        ros_node.trigger_localization()
+        self._set_headers()
+        self.wfile.write(json.dumps({"status": "localization_triggered"}).encode())
 
 def run_server():
-    server = HTTPServer((SERVER_HOST, SERVER_PORT), JueyingLite3ProHandler)
-    print(f"HTTP server running at http://{SERVER_HOST}:{SERVER_PORT}/")
+    server = HTTPServer((HTTP_HOST, HTTP_PORT), DriverRequestHandler)
     try:
+        print(f"Starting HTTP server at http://{HTTP_HOST}:{HTTP_PORT}")
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        sensor_receiver.stop()
+        rclpy.shutdown()
         server.server_close()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     run_server()
