@@ -1,203 +1,187 @@
 import os
-import threading
-import time
+import asyncio
 import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-
+from fastapi import FastAPI, Request, Response, status
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Twist
+from std_srvs.srv import Trigger
+from nav2_msgs.srv import ManageLifecycleNodes
 from std_msgs.msg import String
 
-# Configuration from environment variables
-ROBOT_IP = os.environ.get('ROBOT_IP', '127.0.0.1')
-ROS_DOMAIN_ID = int(os.environ.get('ROS_DOMAIN_ID', '0'))
-HTTP_HOST = os.environ.get('HTTP_HOST', '0.0.0.0')
-HTTP_PORT = int(os.environ.get('HTTP_PORT', '8080'))
+# Environment Variables
+DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
+ROS_DOMAIN_ID = os.environ.get("ROS_DOMAIN_ID", "0")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
 
-os.environ['ROS_DOMAIN_ID'] = str(ROS_DOMAIN_ID)
+os.environ["ROS_DOMAIN_ID"] = ROS_DOMAIN_ID
 
-rclpy.init(args=None)
+app = FastAPI()
 
-class ImuDataBuffer:
+# --------- ROS2 Client Node Management ---------
+class RosClient(Node):
     def __init__(self):
-        self.lock = threading.Lock()
-        self.latest_imu = None
-
-    def update(self, msg):
-        with self.lock:
-            self.latest_imu = msg
-
-    def get(self):
-        with self.lock:
-            return self.latest_imu
-
-imu_buffer = ImuDataBuffer()
-
-class RobotROSNode(Node):
-    def __init__(self):
-        super().__init__('driver_http_server_node')
-        self.imu_sub = self.create_subscription(
-            Imu,
-            '/imu/data',
-            self.imu_callback,
-            10
-        )
-        self.cmd_vel_pub = self.create_publisher(
-            Twist,
-            '/cmd_vel',
-            10
-        )
-        self.map_trigger_pub = self.create_publisher(
-            String,
-            '/slam/trigger',
-            10
-        )
-        self.localization_pub = self.create_publisher(
-            String,
-            '/localization/trigger',
-            10
-        )
+        super().__init__('jueying_lite3pro_driver')
+        self.imu_data = None
+        self.imu_future = None
+        self.imu_event = asyncio.Event()
+        self.create_subscription(Imu, '/imu/data', self.imu_callback, 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        # Localization trigger (could be a service or topic depending on robot setup)
+        self.localization_client = self.create_client(Trigger, '/localization_trigger')
+        # Mapping trigger (could be a service or topic depending on robot setup)
+        self.mapping_client = self.create_client(Trigger, '/mapping_trigger')
 
     def imu_callback(self, msg):
-        imu_buffer.update(msg)
+        self.imu_data = {
+            "orientation": {
+                "x": msg.orientation.x,
+                "y": msg.orientation.y,
+                "z": msg.orientation.z,
+                "w": msg.orientation.w
+            },
+            "angular_velocity": {
+                "x": msg.angular_velocity.x,
+                "y": msg.angular_velocity.y,
+                "z": msg.angular_velocity.z
+            },
+            "linear_acceleration": {
+                "x": msg.linear_acceleration.x,
+                "y": msg.linear_acceleration.y,
+                "z": msg.linear_acceleration.z
+            }
+        }
+        self.imu_event.set()
 
-    def publish_velocity(self, linear_x=0.0, linear_y=0.0, angular_z=0.0):
+    async def get_imu_data(self, timeout=1.0):
+        self.imu_event.clear()
+        if self.imu_data is not None:
+            return self.imu_data
+        try:
+            await asyncio.wait_for(self.imu_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        return self.imu_data
+
+    async def trigger_localization(self):
+        if not self.localization_client.wait_for_service(timeout_sec=2.0):
+            return {"success": False, "message": "Localization service unavailable"}
+        req = Trigger.Request()
+        future = self.localization_client.call_async(req)
+        await asyncio.wrap_future(future)
+        resp = future.result()
+        return {"success": resp.success, "message": resp.message}
+
+    async def trigger_mapping(self):
+        if not self.mapping_client.wait_for_service(timeout_sec=2.0):
+            return {"success": False, "message": "Mapping service unavailable"}
+        req = Trigger.Request()
+        future = self.mapping_client.call_async(req)
+        await asyncio.wrap_future(future)
+        resp = future.result()
+        return {"success": resp.success, "message": resp.message}
+
+    def publish_cmd_vel(self, linear_x, linear_y, linear_z, angular_x, angular_y, angular_z):
         twist = Twist()
         twist.linear.x = linear_x
         twist.linear.y = linear_y
+        twist.linear.z = linear_z
+        twist.angular.x = angular_x
+        twist.angular.y = angular_y
         twist.angular.z = angular_z
         self.cmd_vel_pub.publish(twist)
+        return {"success": True}
 
-    def trigger_map(self):
-        msg = String()
-        msg.data = 'start'
-        self.map_trigger_pub.publish(msg)
+ros_client = None
 
-    def trigger_localization(self):
-        msg = String()
-        msg.data = 'start'
-        self.localization_pub.publish(msg)
+# ------------- FastAPI Data Models ---------------
+class MoveParams(BaseModel):
+    linear_x: float = 0.0
+    linear_y: float = 0.0
+    linear_z: float = 0.0
+    angular_x: float = 0.0
+    angular_y: float = 0.0
+    angular_z: float = 0.0
 
-ros_node = RobotROSNode()
-
-def spin_ros():
-    rclpy.spin(ros_node)
-
-ros_thread = threading.Thread(target=spin_ros, daemon=True)
-ros_thread.start()
-
-def imu_msg_to_dict(msg):
-    return {
-        "header": {
-            "stamp": {
-                "sec": msg.header.stamp.sec,
-                "nanosec": msg.header.stamp.nanosec
-            },
-            "frame_id": msg.header.frame_id
-        },
-        "orientation": {
-            "x": msg.orientation.x,
-            "y": msg.orientation.y,
-            "z": msg.orientation.z,
-            "w": msg.orientation.w
-        },
-        "orientation_covariance": list(msg.orientation_covariance),
-        "angular_velocity": {
-            "x": msg.angular_velocity.x,
-            "y": msg.angular_velocity.y,
-            "z": msg.angular_velocity.z,
-        },
-        "angular_velocity_covariance": list(msg.angular_velocity_covariance),
-        "linear_acceleration": {
-            "x": msg.linear_acceleration.x,
-            "y": msg.linear_acceleration.y,
-            "z": msg.linear_acceleration.z,
-        },
-        "linear_acceleration_covariance": list(msg.linear_acceleration_covariance)
-    }
-
-class DriverRequestHandler(BaseHTTPRequestHandler):
-    server_version = "JueyingLite3ProHTTPDriver/1.0"
-
-    def _set_headers(self, status=200, content_type="application/json"):
-        self.send_response(status)
-        self.send_header('Content-type', content_type)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-
-    def do_OPTIONS(self):
-        self.send_response(200, "ok")
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-
-    def do_GET(self):
-        parsed_path = urlparse(self.path)
-        if parsed_path.path == '/imu':
-            self.handle_imu()
-        elif parsed_path.path == '/move':
-            self.handle_move(parsed_path)
-        else:
-            self._set_headers(404)
-            self.wfile.write(json.dumps({"error": "Not found"}).encode())
-
-    def do_POST(self):
-        parsed_path = urlparse(self.path)
-        if parsed_path.path == '/map':
-            self.handle_map()
-        elif parsed_path.path == '/local':
-            self.handle_local()
-        else:
-            self._set_headers(404)
-            self.wfile.write(json.dumps({"error": "Not found"}).encode())
-
-    def handle_imu(self):
-        imu = imu_buffer.get()
-        if imu is None:
-            self._set_headers(503)
-            self.wfile.write(json.dumps({"error": "IMU data not available"}).encode())
-            return
-        self._set_headers()
-        self.wfile.write(json.dumps(imu_msg_to_dict(imu)).encode())
-
-    def handle_move(self, parsed_path):
-        params = parse_qs(parsed_path.query)
-        try:
-            linear_x = float(params.get('linear_x', [0.0])[0])
-            linear_y = float(params.get('linear_y', [0.0])[0])
-            angular_z = float(params.get('angular_z', [0.0])[0])
-        except Exception:
-            self._set_headers(400)
-            self.wfile.write(json.dumps({"error": "Invalid parameters"}).encode())
-            return
-        ros_node.publish_velocity(linear_x=linear_x, linear_y=linear_y, angular_z=angular_z)
-        self._set_headers()
-        self.wfile.write(json.dumps({"status": "ok", "linear_x": linear_x, "linear_y": linear_y, "angular_z": angular_z}).encode())
-
-    def handle_map(self):
-        ros_node.trigger_map()
-        self._set_headers()
-        self.wfile.write(json.dumps({"status": "mapping_triggered"}).encode())
-
-    def handle_local(self):
-        ros_node.trigger_localization()
-        self._set_headers()
-        self.wfile.write(json.dumps({"status": "localization_triggered"}).encode())
-
-def run_server():
-    server = HTTPServer((HTTP_HOST, HTTP_PORT), DriverRequestHandler)
-    try:
-        print(f"Starting HTTP server at http://{HTTP_HOST}:{HTTP_PORT}")
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
+# ----------- Startup & ROS2 Background -----------
+@app.on_event("startup")
+async def ros2_startup():
+    global ros_client
+    def ros2_spin():
+        rclpy.init()
+        global ros_client
+        ros_client = RosClient()
+        executor = rclpy.executors.MultiThreadedExecutor()
+        executor.add_node(ros_client)
+        executor.spin()
+        ros_client.destroy_node()
         rclpy.shutdown()
-        server.server_close()
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, ros2_spin)
+    # Wait for node startup
+    await asyncio.sleep(2)
 
-if __name__ == '__main__':
-    run_server()
+# -------------- API Endpoints --------------------
+
+@app.get("/imu", response_class=JSONResponse, tags=["Sensor"])
+async def get_imu():
+    """Fetch real-time IMU sensor data (orientation, acceleration)."""
+    data = await ros_client.get_imu_data(timeout=1.5)
+    if data is None:
+        return JSONResponse({"error": "No IMU data received"}, status_code=status.HTTP_504_GATEWAY_TIMEOUT)
+    return JSONResponse(data)
+
+@app.post("/local", response_class=JSONResponse, tags=["Control"])
+async def activate_localization():
+    """Activate localization routine using sensor fusion."""
+    result = await ros_client.trigger_localization()
+    return JSONResponse(result)
+
+@app.get("/move", response_class=JSONResponse, tags=["Motion"])
+async def get_move():
+    """Movement API information (for browser/CLI, shows usage)."""
+    usage = {
+        "description": "To move the robot, send a POST to this endpoint with JSON: "
+                       '{"linear_x": float, "linear_y": float, "linear_z": float, '
+                       '"angular_x": float, "angular_y": float, "angular_z": float}',
+        "example": {
+            "linear_x": 0.1,
+            "linear_y": 0.0,
+            "linear_z": 0.0,
+            "angular_x": 0.0,
+            "angular_y": 0.0,
+            "angular_z": 0.5
+        }
+    }
+    return JSONResponse(usage)
+
+@app.post("/move", response_class=JSONResponse, tags=["Motion"])
+async def post_move(params: MoveParams):
+    """Send velocity commands to the robot."""
+    result = await run_in_threadpool(
+        ros_client.publish_cmd_vel,
+        params.linear_x, params.linear_y, params.linear_z,
+        params.angular_x, params.angular_y, params.angular_z
+    )
+    return JSONResponse(result)
+
+@app.post("/map", response_class=JSONResponse, tags=["Mapping"])
+async def start_mapping():
+    """Initiate the mapping (SLAM) process."""
+    result = await ros_client.trigger_mapping()
+    return JSONResponse(result)
+
+# --------------- Main Entrypoint -----------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host=SERVER_HOST,
+        port=SERVER_PORT,
+        reload=False
+    )
