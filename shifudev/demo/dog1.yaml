@@ -5,7 +5,7 @@ metadata:
   namespace: deviceshifu
   labels:
     app: deviceshifu-dog1
-    workspace_id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+    workspace_id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
     workspace_name: "demo"
 data:
   driverProperties: |
@@ -20,16 +20,16 @@ metadata:
   namespace: devices
   labels:
     app: deviceshifu-dog1
-    workspace_id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+    workspace_id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
     workspace_name: "demo"
   annotations:
-    workspace.id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+    workspace.id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
     workspace.name: "demo"
     template.id: "robotdog-mqtt-v1"
 spec:
   sku: "Robot Dog MQTT Device"
   connection: Ethernet
-  address: "192.168.4.101:43893"
+  address: "192.168.4.101"
   protocol: UDP
 ---
 apiVersion: apps/v1
@@ -37,7 +37,7 @@ kind: Deployment
 metadata:
   labels:
     app: deviceshifu-dog1
-    workspace_id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+    workspace_id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
   name: deviceshifu-dog1
   namespace: deviceshifu
 spec:
@@ -49,10 +49,10 @@ spec:
     metadata:
       labels:
         app: deviceshifu-dog1
-        workspace_id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+        workspace_id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
     spec:
       containers:
-        - image: edgenesis/deeprobotics-robotdog-mqtt:v0.0.1
+        - image: edgenesis/deeprobotics-robotdog-mqtt:v0.0.2
           name: deviceshifu-dog1
           imagePullPolicy: IfNotPresent
           ports:
@@ -69,11 +69,12 @@ spec:
               value: "devices"
             - name: MQTT_BROKER_ADDRESS
               value: ""
-            
             # No MQTT authentication configured in workspace
             
             - name: CONFIG_MOUNT_PATH
               value: "/etc/edgedevice/config"
+            - name: DATA_FETCH_INTERVAL_SECONDS
+              value: "1"
       volumes:
         - name: deviceshifu-config
           configMap:
@@ -85,7 +86,7 @@ kind: Service
 metadata:
   labels:
     app: deviceshifu-dog1
-    workspace_id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+    workspace_id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
   name: deviceshifu-dog1
   namespace: deviceshifu
 spec:
