@@ -117,7 +117,7 @@ spec:
             - name: EDGEDEVICE_NAMESPACE
               value: "devices"
             - name: MQTT_BROKER
-              value: "tcp://broker.hivemq.com:1883"
+              value: "broker.hivemq.com:1883"
             - name: MQTT_BROKER_PORT
               value: "1883"
             
