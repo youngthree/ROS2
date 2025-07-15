@@ -4,7 +4,7 @@ metadata:
   name: cam-01-configmap
   namespace: deviceshifu
   annotations:
-    workspace.id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+    workspace.id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
     workspace.name: "demo"
 data:
   driverProperties: |
@@ -23,7 +23,7 @@ kind: Deployment
 metadata:
   labels:
     app: deviceshifu-cam-01
-    workspace.id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+    workspace.id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
     workspace.name: "demo"
   name: deviceshifu-cam-01
   namespace: deviceshifu
@@ -36,7 +36,7 @@ spec:
     metadata:
       labels:
         app: deviceshifu-cam-01
-        workspace.id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+        workspace.id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
         workspace.name: "demo"
     spec:
       containers:
@@ -78,7 +78,7 @@ kind: Service
 metadata:
   labels:
     app: deviceshifu-cam-01
-    workspace.id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+    workspace.id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
     workspace.name: "demo"
   name: deviceshifu-cam-01
   namespace: deviceshifu
@@ -97,7 +97,7 @@ metadata:
   name: edgedevice-cam-01
   namespace: devices
   annotations:
-    workspace.id: "c66b359e-5c7e-425a-ba5f-80c7ab71a188"
+    workspace.id: "cdef6dc9-678e-4a15-91ac-dbb36f61528b"
     workspace.name: "demo"
 spec:
   sku: "HTTP USB Camera Device"
