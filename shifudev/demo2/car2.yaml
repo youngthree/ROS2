@@ -1,0 +1,153 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deviceshifu-car2-config
+  namespace: deviceshifu
+  labels:
+    app: deviceshifu-car2
+    workspace_id: "a9ca173a-e970-446c-9660-1eefdd1b28d7"
+    workspace_name: "demo2"
+data:
+  driverProperties: |
+    driverSku: wheeltec
+    driverImage: edgehub/deviceshifu-car-mqtt:latest
+  instructions: |
+    instructions:
+      # Simple Control Topics
+      /move/forward:
+        protocolPropertyList:
+          mode: subscriber
+      /move/backward:
+        protocolPropertyList:
+          mode: subscriber
+      /turn/left:
+        protocolPropertyList:
+          mode: subscriber
+      /turn/right:
+        protocolPropertyList:
+          mode: subscriber
+      /stop:
+        protocolPropertyList:
+          mode: subscriber
+      # Advanced Control Topic
+      /cmd_vel:
+        protocolPropertyList:
+          mode: subscriber
+      # ROS Data Topics (published to MQTT)
+      /odom:
+        protocolPropertyList:
+          mode: publisher
+          publishIntervalMS: 100
+      /scan:
+        protocolPropertyList:
+          mode: publisher
+          publishIntervalMS: 100
+      /joint_states:
+        protocolPropertyList:
+          mode: publisher
+          publishIntervalMS: 100
+      /point_cloud:
+        protocolPropertyList:
+          mode: publisher
+          publishIntervalMS: 500
+      /cmd_vel_echo:
+        protocolPropertyList:
+          mode: publisher
+          publishIntervalMS: 100
+      
+      # Status
+      /status:
+        protocolPropertyList:
+          mode: publisher
+          publishIntervalMS: 1000
+---
+
+apiVersion: shifu.edgenesis.io/v1alpha1
+kind: EdgeDevice
+metadata:
+  name: deviceshifu-car2-edgedevice
+  namespace: devices
+  labels:
+    app: deviceshifu-car2
+    workspace_id: "a9ca173a-e970-446c-9660-1eefdd1b28d7"
+    workspace_name: "demo2"
+  annotations:
+    workspace.id: "a9ca173a-e970-446c-9660-1eefdd1b28d7"
+    workspace.name: "demo2"
+    template.id: "mqtt-car-v1"
+spec:
+  sku: "wheeltec"
+  connection: Ethernet
+  address: 192.168.2.101:3030
+  protocol: ROS
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: deviceshifu-car2
+    workspace_id: "a9ca173a-e970-446c-9660-1eefdd1b28d7"
+  name: deviceshifu-car2
+  namespace: deviceshifu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deviceshifu-car2
+  template:
+    metadata:
+      labels:
+        app: deviceshifu-car2
+        workspace_id: "a9ca173a-e970-446c-9660-1eefdd1b28d7"
+    spec:
+      containers:
+        - image: edgenesis/deviceshifu-car-mqtt:v0.0.1
+          name: deviceshifu-car2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: deviceshifu-config
+              mountPath: "/etc/edgedevice/config"
+              readOnly: true
+          env:
+            - name: EDGEDEVICE_NAME
+              value: "deviceshifu-car2-edgedevice"
+            - name: EDGEDEVICE_NAMESPACE
+              value: "devices"
+            - name: MQTT_BROKER
+              value: "broker.hivemq.com:1883"
+            - name: MQTT_BROKER_PORT
+              value: "1883"
+            
+            # No MQTT authentication configured in workspace
+            
+            - name: MQTT_TOPIC_PREFIX
+              value: "/demo2/car2"
+            - name: CONFIG_MOUNT_PATH
+              value: "/etc/edgedevice/config"
+      volumes:
+        - name: deviceshifu-config
+          configMap:
+            name: deviceshifu-car2-config
+      serviceAccountName: edgedevice-sa
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: deviceshifu-car2
+    workspace_id: "a9ca173a-e970-446c-9660-1eefdd1b28d7"
+  name: deviceshifu-car2-service
+  namespace: deviceshifu
+spec:
+  ports:
+    - port: 80
+      protocol: TCP
+      targetPort: 8080
+      name: http
+  selector:
+    app: deviceshifu-car2
+  type: ClusterIP 
